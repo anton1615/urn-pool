@@ -28,7 +28,7 @@ DB = os.path.join(HERE, "hub.sqlite")
 POOL = os.path.join(HERE, "pool.txt")
 SPEED_POOL = os.path.join(HERE, "speed-pool.txt")
 POOL_DB = os.path.join(HERE, "db.sqlite")   # urn-pool's store (read-only use)
-URNPROXY = os.environ.get("URNPROXY", "/data/home/urn/urnproxy")
+URNPROXY = os.environ.get("URNPROXY", os.path.expanduser("~/urnproxy"))
 API = "https://api.bringyour.com"
 
 BATCH = 6

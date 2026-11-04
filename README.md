@@ -105,7 +105,7 @@ git clone <this repo> ~/urn-pool
 git clone https://github.com/urnetwork/proxy urn-proxy && cd urn-proxy
 # patch login to seedphrase: POST /auth/login {"seedphrase": "..."}
 go build -o urnproxy ./socks
-cp urnproxy ~/urn-pool urnproxy   # or pass --urnproxy /path/to/urnproxy
+cp urnproxy ~/urn-pool/urnproxy   # or pass --urnproxy /path/to/urnproxy
 ```
 
 Configure the account pool (kept next to the code or wherever your units
