@@ -24,6 +24,9 @@ swap choreography, adapted from token pools to seedphrase accounts.
 - 🌍 **Region switching / rotation nobody notices** — `/country` and `/rotate`
   warm up the replacement backend first; existing connections keep flowing
   while the old one drains
+- 🔌 **SOCKS5 *and* HTTP CONNECT on the same port** — the front sniffs the
+  first byte, so a proxy-only consumer (curl `--proxy http://…`, many
+  scrapers) needs no converter
 - 🧾 mihomo subscription endpoints (`/sub`, `/sub?uid=…`) plus plain SOCKS5
 - 🔋 **Quota self-management** — each account gets a free daily grant
   (~30 GiB, UTC 00:00); the wrapper probes `/subscription/balance` every
@@ -44,7 +47,7 @@ swap choreography, adapted from token pools to seedphrase accounts.
 ## 🧠 How it works
 
 ```
-client ──socks5h──> <bind-host>:2100x   🚪 front (pure byte relay, no protocol)
+client ──socks5h / HTTP CONNECT──> <bind-host>:2100x  🚪 front (terminates the handshake)
                                            │
               old backend keeps serving its connections ◄── 🔁 flip
                                            │                (drain, then retire)
@@ -58,10 +61,18 @@ to the network address, stable for its lifetime) served by a byte-relay, and
 an **internal urnproxy process** (`127.0.0.1:31000+`, `--provider-id` or
 `--country` pinned) holding one account from the pool.
 
+The front accepts **both SOCKS5 and HTTP proxy (`CONNECT`) clients on the
+same port**, so a client that only speaks HTTP proxy needs no socks5→http
+converter. It peeks at the first byte: `0x05` → it completes the SOCKS5
+handshake itself; `C` → it reads the request line, requires `CONNECT
+host:port`, dials it and answers `200 Connection Established`; anything else
+gets `405` and the socket closes. Either way it then dials the backend's
+SOCKS5 port on the client's behalf and moves bytes.
+
 The key trick (inherited from foxyvpn-pool): SOCKS5 carries exactly **one
-tunnel per TCP connection**, so the relay in front of each backend needs to
-understand no protocol at all — it just moves bytes. Every client connection
-is independent; a swap only affects connections that arrive after it.
+tunnel per TCP connection**, so the front only has to understand the
+handshake — after it, every client connection is independent and a swap only
+affects connections that arrive after it.
 
 ## 🔑 The seedphrase account pool
 
