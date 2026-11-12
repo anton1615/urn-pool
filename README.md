@@ -37,6 +37,9 @@ swap choreography, adapted from token pools to seedphrase accounts.
   into the hub DB
 - ⚙️ Full instance lifecycle from the API: register, delete, list locations,
   switch country, rotate, status
+- 🎛 **Dashboard included** — every client as a card (port, exit, quota left,
+  relays) with create / rotate / delete buttons; one rotate button per card,
+  no country picker
 
 ## 🧠 How it works
 
@@ -135,12 +138,41 @@ systemctl --user enable --now urn-pool urn-speed urn-hub.timer
 ```
 
 By default the API binds to the machine's Tailscale address (port 8090).
-Override with `--bind-host`. `--ui-token <secret>` is optional; when given,
-the dashboard and every API path also live under `/<secret>/`, and the bare
-root returns 404. Without a token the dashboard is served on `/` and only the
-tailnet can reach it.
+Override with `--bind-host`.
+
+## 🖥️ Web UI
+
+`urnpool.py` ships a dashboard for the same API. Without `--ui-token` it is
+served on `/`, which only the tailnet can reach; set `--ui-token` and it moves
+to `/<token>/` (the bare root then returns 404). The token is an alias, not a
+gate: every API path also answers under it (`/<token>/register`,
+`/<token>/sub`, …), while the bare paths keep working unchanged, so existing
+subscriptions and clients need no edit.
+
+```bash
+python3 ~/urn-pool/urnpool.py --ui-token "$(openssl rand -hex 12)"
+# → http://<tailnet-ip>:8090/<token>/
+```
+
+The page lists every client with its name, public port, SOCKS5 URL, current
+exit (pinned provider or country), account count, remaining/max quota, live
+connection count and how long ago it rotated, and offers:
+
+- ➕ create a client from a name alone — the exit is drawn for it, no country
+  picker,
+- ♻️ **rotate** — one button that runs `/rotate`: a whole-pool weighted random
+  provider pick, the new exit is verified to pass traffic before it is
+  accepted, and the public port never changes,
+- 🗑 delete a client, behind a confirmation dialog.
+
+Quota per client is the sum over its accounts, so exhaustion shows up on the
+card before any consumer notices. It refreshes itself every 15 s.
 
 ## ⚙️ HTTP API
+
+Example host below: `[IP]` — replace with your own. With `--ui-token TOKEN`
+every path in the table also answers under `/<TOKEN>` (`/status` and
+`/<TOKEN>/status` are the same endpoint); the bare paths are unchanged.
 
 | Endpoint | Meaning |
 |---|---|
@@ -183,6 +215,9 @@ address to the public internet.
 
 - Nothing enforces a client↔node mapping: any client on the network can reach
   any node the host has created and steer it via a known `uid`.
+- `--ui-token` only moves the dashboard off the bare root: the same actions
+  stay reachable at the bare API paths, so it is a convenience URL, not a
+  gate. Without it the dashboard sits on `/` for anyone on the network.
 - Backend listeners are loopback-only. The urnproxy login passes the
   seedphrase via the `USER_AUTH` environment variable — keep it out of
   shared process listings.
