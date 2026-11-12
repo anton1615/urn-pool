@@ -56,6 +56,7 @@ import os
 import random
 import re
 import socket
+import struct
 import signal
 import sqlite3
 import subprocess
@@ -64,6 +65,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -74,8 +76,11 @@ DEFAULT_POOL = os.path.join(HERE, "pool.txt")
 DEFAULT_AUTH_DIR = os.path.join(HERE, "auth")
 DEFAULT_LOG_DIR = os.path.join(HERE, "logs")
 DEFAULT_DB = os.path.join(HERE, "db.sqlite")
-DEFAULT_URNPROXY = os.path.expanduser("~/urnproxy")
+DEFAULT_URNPROXY = os.environ.get("URNPROXY", os.path.expanduser("~/urnproxy"))
 HUB_OPEN = os.path.join(HERE, "hub-open.json")   # urn-hub.py's open set
+SCORE_TTL = 24 * 3600             # a speed score older than this is not "fresh"
+PICK_WEIGHTS = (0.80, 0.14, 0.06)  # tier 1 fresh scored / tier 2 older scored / tier 3 rest
+PICK_MEMORY = 100                  # never re-hand-out a node picked in the last N picks
 API_URL = "https://api.bringyour.com"
 DEFAULT_COUNTRY = "United States"
 
@@ -84,11 +89,14 @@ INTERNAL_PORT_BASE = 31000
 ACCOUNTS_PER_INSTANCE = 1
 ROTATE_QUOTA_FRACTION = 0.05      # rotate once even the best account is under 5%
 DRAIN_TIMEOUT = 120.0             # seconds to wait for the old backend to drain
+KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 1))    # rotate 後,上游已回完的閒置連線靜默幾秒就斬
+KILL_REQ_GRACE = float(os.environ.get("KILL_REQ_GRACE", 30))     # 請求已送、等首位元組的連線保留至少此秒數
 PROBE_CONCURRENCY = 4
 PROBE_SAMPLE = 24                 # free 帳號每輪只探這麼多，其餘沿用上次數字
-BACKEND_READY_TIMEOUT = 45.0
+BACKEND_READY_TIMEOUT = 15.0      # port opens in ~1.4s (p90 2.4s) on live picks
+BURST_READY_TIMEOUT = 45.0        # restore/supervise fight the address-level 429 storm
 RESERVED_PATHS = {"register", "delete", "sub", "locations", "status",
-                  "country", "rotate", "providers", "favicon.ico"}
+                  "country", "rotate", "providers", "favicon.ico", "ui-state"}
 
 
 class LoginRejected(Exception):
@@ -257,7 +265,7 @@ class Front:
         self.port = port
         self.backend: tuple[str, int] | None = None
         self._server: asyncio.AbstractServer | None = None
-        self._relays: dict[int, tuple[str, int]] = {}
+        self._relays: dict[int, dict] = {}   # relay_id -> {backend, last_up, last_down, writers}
         self._next_id = 0
 
     async def start(self) -> None:
@@ -274,10 +282,37 @@ class Front:
         self.backend = backend
 
     def relay_count(self, backend: tuple[str, int]) -> int:
-        return sum(1 for v in self._relays.values() if v == backend)
+        return sum(1 for r in self._relays.values() if r["backend"] == backend)
 
     def total_relays(self) -> int:
         return len(self._relays)
+
+    def kill_idle(self, backend: tuple[str, int], grace_req: float, grace_resp: float) -> int:
+        """Close conns on `backend` silent longer than their grace; return how many.
+
+        Each direction is timed separately:
+          last_up   last byte upstream→client (response / streamed tokens)
+          last_down last byte client→upstream (request)
+        An idle pooled conn is silent both ways -> cut after grace_resp so the
+        next request re-dials onto the new backend. A live stream keeps
+        last_up fresh (measured max inter-token gap: 6s) -> never cut. A
+        request still waiting for its first byte keeps last_down fresh ->
+        protected for grace_req.
+        """
+        now = time.monotonic()
+        killed = 0
+        for r in list(self._relays.values()):
+            if r["backend"] != backend:
+                continue
+            if now - r["last_down"] < grace_req:
+                continue          # client spoke recently: may be awaiting a reply
+            if now - r["last_up"] < grace_resp:
+                continue          # upstream still streaming: leave it alone
+            killed += 1
+            for w in r["writers"]:
+                with contextlib.suppress(Exception):
+                    w.close()
+        return killed
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         backend = self.backend
@@ -298,9 +333,14 @@ class Front:
             return
         self._next_id += 1
         relay_id = self._next_id
-        self._relays[relay_id] = backend
+        if not await _http_bridge(reader, writer, br, bw):
+            return                    # 交握失敗:連線已在 bridge 裡收掉
+        entry = {"backend": backend, "last_up": time.monotonic(),
+                 "last_down": time.monotonic(), "writers": (writer, bw)}
+        self._relays[relay_id] = entry
         try:
-            await asyncio.gather(self._pipe(reader, bw), self._pipe(br, writer),
+            await asyncio.gather(self._pipe(reader, bw, entry, False),
+                                 self._pipe(br, writer, entry, True),
                                  return_exceptions=True)
         finally:
             self._relays.pop(relay_id, None)
@@ -309,7 +349,8 @@ class Front:
                     w.close()
 
     @staticmethod
-    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                    entry: dict, upstream: bool) -> None:
         try:
             while True:
                 data = await reader.read(65536)
@@ -317,11 +358,109 @@ class Front:
                     break
                 writer.write(data)
                 await writer.drain()
+                entry["last_up" if upstream else "last_down"] = time.monotonic()
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
+
+
+async def _socks5_dial(br, bw, host: str, port: int) -> bool:
+    """對 backend(urnproxy SOCKS5)做 CONNECT。True=br/bw 可傳目標資料。"""
+    try:
+        bw.write(b"\x05\x01\x00")
+        await bw.drain()
+        r = await asyncio.wait_for(br.readexactly(2), timeout=25)
+        if r[0] != 5:
+            return False
+        hb = host.encode()
+        if len(hb) > 255:
+            return False
+        bw.write(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", port))
+        await bw.drain()
+        r2 = await asyncio.wait_for(br.readexactly(10), timeout=25)
+        return r2[1] == 0
+    except Exception:
+        return False
+
+
+async def _http_bridge(reader, writer, br, bw) -> bool:
+    """front 一洞雙協議:socks5 或 HTTP CONNECT 都收。
+
+    偷看第一個 byte:
+      0x05        → SOCKS5:front 自己完成交握
+      "CONNECT.." → 對後端 socks5-dial,回 200
+      其他        → 405 斷線
+    True=交握完成,caller 接手雙向 pipe;False=連線已收。
+    """
+    async def drop():
+        writer.close()
+        bw.close()
+        return False
+    try:
+        first = await asyncio.wait_for(reader.readexactly(1), timeout=60)
+    except Exception:
+        return await drop()
+    if first == b"\x05":
+        try:
+            nm = (await reader.readexactly(1))[0]
+            await reader.readexactly(nm)
+            writer.write(b"\x05\x00"); await writer.drain()
+            req = await reader.readexactly(4)
+            if req[1] != 1:
+                raise ValueError("connect only")
+            atyp = req[3]
+            if atyp == 1:
+                host = socket.inet_ntoa(await reader.readexactly(4))
+            elif atyp == 3:
+                n = (await reader.readexactly(1))[0]
+                host = (await reader.readexactly(n)).decode("utf-8", "replace")
+            else:
+                await reader.readexactly(16)
+                host = "127.0.0.1"
+            port = struct.unpack("!H", await reader.readexactly(2))[0]
+            if not await _socks5_dial(br, bw, host, port):
+                writer.write(b"\x05\x05\x00\x01" + b"\x00" * 6)
+                with contextlib.suppress(Exception):
+                    await writer.drain()
+                raise ValueError("inner refused")
+            writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+            await writer.drain()
+        except Exception:
+            return await drop()
+    elif first in (b"C", b"c"):
+        try:
+            buf = first
+            while b"\r\n\r\n" not in buf:
+                more = await asyncio.wait_for(reader.read(4096), timeout=60)
+                if not more:
+                    raise ValueError("truncated")
+                buf += more
+            req_line = buf.split(b"\r\n", 1)[0].decode("latin1")
+            parts = req_line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                raise ValueError("not CONNECT")
+            host, _, port_s = parts[1].rpartition(":")
+            if not await _socks5_dial(br, bw, host, int(port_s)):
+                raise ValueError("inner refused")
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            idx = buf.find(b"\r\n\r\n")
+            left = buf[idx + 4:] if idx >= 0 else b""
+            if left:
+                bw.write(left); await bw.drain()
+        except Exception:
+            with contextlib.suppress(Exception):
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            return await drop()
+    else:
+        with contextlib.suppress(Exception):
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+        return await drop()
+    return True
 
 
 # ── urnproxy backend ───────────────────────────────────────────────────────
@@ -364,6 +503,12 @@ class Wrapper:
         self._rotate_lock = asyncio.Lock()
         self._servers: tuple[float, dict] | None = None
         self._providers: dict[str, tuple[float, list[dict]]] = {}
+        # Providers handed out by the last PICK_MEMORY picks. A rotate picks
+        # 3 candidates in a row, and 26 instances may rotate concurrently, so a
+        # plain uniform pick re-hands the same node constantly. Remembering the
+        # picks makes the sequence look "without replacement" instead.
+        self._recent_picks: deque[str] = deque(maxlen=PICK_MEMORY)
+        self._recent_lock = threading.Lock()
 
     # -- account supply ---------------------------------------------------
 
@@ -430,6 +575,16 @@ class Wrapper:
             raise LoginRejected(seedphrase[:12])
         self._jwts[seedphrase] = (jwt, now + 29 * 86400)
         return jwt
+
+    def _cached_jwt(self, seedphrase: str) -> str:
+        """by_jwt for one account, or "" when the login API refuses.
+
+        Called off the event loop: a miss is a real HTTP round trip.
+        """
+        try:
+            return self._login(seedphrase)
+        except LoginRejected:
+            return ""
 
     def _balance(self, seedphrase: str) -> tuple[int, int, str]:
         """(quota_max, quota_left, reset) for one account."""
@@ -509,8 +664,8 @@ class Wrapper:
 
     # -- backends ----------------------------------------------------------
 
-    def spawn_backend(self, inst: Instance, tokens: list[str],
-                      internal_port: int) -> Backend:
+    async def spawn_backend(self, inst: Instance, tokens: list[str],
+                            internal_port: int) -> Backend:
         cmd = [self.args.urnproxy,
                "--addr", f"127.0.0.1:{internal_port}"]
         if inst.proxy:
@@ -523,15 +678,25 @@ class Wrapper:
         env = os.environ.copy()
         # shortcut: urnproxy logs in once per process, so one account per instance
         env["USER_AUTH"] = tokens[0] if tokens else ""
+        if tokens:
+            # /auth/login is rate limited per network address: hand the adapter a
+            # cached by_jwt instead of one login per spawn
+            jwt = await asyncio.to_thread(self._cached_jwt, tokens[0])
+            if jwt:
+                env["BY_JWT"] = jwt
         env["PASSWORD"] = "urn-pool"
         logfile = open(logpath, "ab", buffering=0)
         proc = subprocess.Popen(cmd, stdout=logfile, stderr=subprocess.STDOUT,
                                 start_new_session=True, env=env)
         return Backend(proc, internal_port, tokens)
 
-    async def wait_ready(self, port: int, timeout: float = BACKEND_READY_TIMEOUT) -> bool:
+    async def wait_ready(self, port: int, timeout: float = BACKEND_READY_TIMEOUT,
+                         proc: subprocess.Popen | None = None) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if proc is not None and proc.poll() is not None:
+                # adapter exited (login/contract refused): don't wait out the timeout
+                return False
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection("127.0.0.1", port), timeout=1.0)
@@ -544,15 +709,24 @@ class Wrapper:
         return False
 
     async def retire_backend(self, inst: Instance, backend: Backend | None) -> None:
-        """Wait for the old backend's connections to drain, then stop it."""
+        """Wait for the old backend's connections to drain, then stop it.
+
+        Idle conns left on the retired backend are shut after their grace so
+        the client's next request has to dial again and lands on the new
+        backend (new exit IP) instead of riding the old one for up to
+        DRAIN_TIMEOUT. Conns still moving bytes keep it alive until done.
+        """
         if backend is None:
             return
+        target = ("127.0.0.1", backend.port)
         deadline = time.monotonic() + DRAIN_TIMEOUT
         while time.monotonic() < deadline:
             if backend.proc.poll() is not None:
                 break
-            if inst.front is not None and inst.front.relay_count(("127.0.0.1", backend.port)) == 0:
-                break
+            if inst.front is not None:
+                if inst.front.relay_count(target) == 0:
+                    break
+                inst.front.kill_idle(target, KILL_REQ_GRACE, KILL_RESP_GRACE)
             await asyncio.sleep(1.0)
         backend.stop()
 
@@ -592,27 +766,32 @@ class Wrapper:
         return killed
 
     async def swap_backend(self, inst: Instance, tokens: list[str],
-                           internal_port: int, retried: bool = False) -> bool:
+                           internal_port: int, retried: bool = False,
+                           ready_timeout: float = BACKEND_READY_TIMEOUT,
+                           account_retry: bool = True) -> bool:
         """Start a replacement and move the relay over to it.
 
         The old instance keeps the connections it already carries; the relay
         only sends new ones to the replacement.
         """
         old = inst.backend
-        backend = self.spawn_backend(inst, tokens, internal_port)
-        if not await self.wait_ready(internal_port):
+        backend = await self.spawn_backend(inst, tokens, internal_port)
+        if not await self.wait_ready(internal_port, timeout=ready_timeout,
+                                     proc=backend.proc):
             backend.stop()
             self.sweep_orphans()
-            if not retried:
+            if not retried and account_retry:
                 # URnetwork 常以 429 / 掛住擋掉同一顆帳號的重新登入；
                 # 換一顆帳號再試一次，否則這次 rotate 就是白白失敗。
+                # /rotate 關掉這條：那裡已經會重抽 3 次，再乘上這個重試就是
+                # 6 次 adapter spawn，直接把位址級限速打爆（2026-11-06 實測）。
                 fresh = self.allocate_tokens(inst.uid, ACCOUNTS_PER_INSTANCE)
                 if fresh and set(fresh) - set(tokens):
                     log(f"  {inst.uid}: spawn failed, retrying with a fresh account")
                     ok = await self.swap_backend(
                         inst, fresh,
                         self.store.next_port("internal_port", INTERNAL_PORT_BASE),
-                        retried=True)
+                        retried=True, ready_timeout=ready_timeout)
                     if ok:
                         self.release_tokens(tokens)
                     else:
@@ -672,7 +851,8 @@ class Wrapper:
         return True
 
     async def rotate_upstream(self, uid: str, country: str = "",
-                              proxy: str = "") -> bool:
+                              proxy: str = "",
+                              account_retry: bool = True) -> bool:
         """Point a client at a different upstream without dropping it."""
         inst = self.instances.get(uid) or self.store.instance(uid)
         if inst is None:
@@ -685,7 +865,8 @@ class Wrapper:
         inst.country = country
         inst.proxy = proxy
         internal = self.store.next_port("internal_port", INTERNAL_PORT_BASE)
-        ok = await self.swap_backend(inst, inst.tokens, internal)
+        ok = await self.swap_backend(inst, inst.tokens, internal,
+                                     account_retry=account_retry)
         if ok:
             what = proxy or country
             log(f"  {uid}: now using {what} (public port unchanged)")
@@ -729,12 +910,16 @@ class Wrapper:
     # -- supervision --------------------------------------------------------
 
     async def supervise(self) -> None:
-        """Restart a backend that died, and adopt the ones that are alive."""
+        """Restart a backend that died, or that never came up at all."""
         for inst in list(self.instances.values()):
-            if inst.backend is not None and not inst.backend.alive():
-                log(f"  {inst.uid}: urnproxy exited, restarting")
+            if inst.backend is None or not inst.backend.alive():
+                # a spawn that failed at restore leaves backend None: retry it
+                # too, otherwise the uid stays dead until a consumer rotates it
+                why = "urnproxy exited" if inst.backend is not None else "no backend"
+                log(f"  {inst.uid}: {why}, restarting")
                 internal = self.store.next_port("internal_port", INTERNAL_PORT_BASE)
-                await self.swap_backend(inst, inst.tokens, internal)
+                await self.swap_backend(inst, inst.tokens, internal,
+                                        ready_timeout=BURST_READY_TIMEOUT)
 
     # -- startup ------------------------------------------------------------
 
@@ -773,7 +958,8 @@ class Wrapper:
             inst.front = front
             # 先登記再換，sweep_orphans 才知道這個埠是活的
             self.instances[inst.uid] = inst
-            if not await self.swap_backend(inst, tokens, inst.internal_port):
+            if not await self.swap_backend(inst, tokens, inst.internal_port,
+                                           ready_timeout=BURST_READY_TIMEOUT):
                 log(f"  {inst.uid}: urnproxy did not come up")
             inst.tokens = tokens
             self.store.put_instance(inst)
@@ -801,6 +987,14 @@ class Wrapper:
                 path = path[len(root):]
                 via_token = True
         one = {k: v[0] for k, v in query.items() if v}
+        if path == "/":
+            # UI lives at the root (bare when no token is set, under the token
+            # otherwise); every client keeps using its plain API paths.
+            if token and not via_token:
+                return 404, "text/plain", "not found\n"
+            return 200, "text/html; charset=utf-8", UI_HTML
+        if path == "/ui-state":
+            return 200, "application/json", json.dumps(self.status(), indent=2)
         if path == "/register":
             uid = one.get("uid", "").strip()
             if not uid:
@@ -867,7 +1061,9 @@ class Wrapper:
                 pid = await asyncio.to_thread(self.random_provider)
                 if not pid:
                     continue
-                if not await self.rotate_upstream(uid, "", pid):
+                # one spawn per pick: the account is unchanged, so the
+                # fresh-account retry would only triple the spawn count
+                if not await self.rotate_upstream(uid, "", pid, account_retry=False):
                     continue
                 # full-pool picks include contract-but-dead providers; verify
                 # the new exit actually passes traffic before accepting it
@@ -875,7 +1071,7 @@ class Wrapper:
                     ok = True
                     break
             if not ok:
-                ok = await self.rotate_upstream(uid, *orig)
+                ok = await self.rotate_upstream(uid, *orig, account_retry=False)
             return (200 if ok else 500), "application/json", json.dumps(
                 self._instance_json(inst), indent=2)
         return 404, "text/plain", "not found\n"
@@ -1051,16 +1247,51 @@ class Wrapper:
         """A random provider from the whole pool.
 
         Prefers urn-hub's open set (hub-open.json: seen in the latest global
-        fetch AND not daemon-proven dead AND exit risk low); falls back to
-        sampling a country weighted by registered provider count, then a
-        random provider in that country (warmer cache, else quick top-600).
-        "" = caller re-picks."""
+        fetch AND not daemon-proven dead AND exit risk low). Inside it, a
+        weighted draw over trust tiers so freshly measured nodes dominate but
+        they never quietly disappear:
+
+          tier 1  speed-measured less than a day ago  PICK_WEIGHTS[0]  (80%)
+          tier 2  measured, but older than a day      PICK_WEIGHTS[1]  (14%)
+          tier 3  never measured                      PICK_WEIGHTS[2]  (6%)
+
+        Within a tier every provider is equally likely, so a repeatedly dying
+        tier-1 does not starve the number that can still be picked. Measured
+        nodes carried traffic 93%/90% of the time vs 40-60% for unmeasured
+        (serial probe, 2026-11-06).
+
+        The last PICK_MEMORY picks are remembered and normally filtered out, so
+        consecutive picks (the up-to-3 candidates of one /rotate) and
+        concurrent rotates do not keep re-handing the same node.
+        """
         try:
             with open(HUB_OPEN, encoding="utf-8") as fh:
                 doc = json.load(fh)
             # stale beyond one missed hub round: the fetcher died, use fallback
             if time.time() - doc["updated_at"] < 3900 and doc.get("providers"):
-                return random.choice(doc["providers"])["id"]
+                provs = doc["providers"]
+                cutoff = time.time() - SCORE_TTL
+                good = [p for p in provs
+                        if p.get("sp") is not None and not p.get("fail")]
+                fresh = [p for p in good if (p.get("sp_ts") or 0) > cutoff]
+                stale = [p for p in good if (p.get("sp_ts") or 0) <= cutoff]
+                rest = [p for p in provs
+                        if p.get("sp") is None or p.get("fail")]
+                # weighted draw over trust, then a uniform pick inside the tier;
+                # weights are renormalized over the tiers that are not empty
+                tiers = [(t, w) for t, w in zip((fresh, stale, rest),
+                                                PICK_WEIGHTS) if t]
+                if tiers:
+                    with self._recent_lock:
+                        pool = [p for p in random.choices(
+                            [t for t, _ in tiers],
+                            weights=[w for _, w in tiers])[0]
+                            if p["id"] not in self._recent_picks]
+                        if not pool:
+                            pool = [p for p in tiers[0][0]]
+                        picked = random.choice(pool)
+                        self._recent_picks.append(picked["id"])
+                        return picked["id"]
         except (OSError, ValueError, KeyError):
             pass
         locations = self.location_list()
@@ -1079,10 +1310,14 @@ class Wrapper:
 
     def status(self) -> dict:
         accounts = self.store.accounts()
+        by_token = {a.token: a for a in accounts}
         insts = []
         for inst in self.instances.values():
             item = self._instance_json(inst)
             item["relays"] = inst.front.total_relays() if inst.front is not None else 0
+            mine = [by_token[t] for t in inst.tokens if t in by_token]
+            item["quota_left_bytes"] = sum(a.quota_left for a in mine)
+            item["quota_max_bytes"] = sum(a.quota_max for a in mine)
             insts.append(item)
         return {
             "host": self.args.bind_host,
@@ -1095,6 +1330,304 @@ class Wrapper:
                 "quota_left_bytes": sum(a.quota_left for a in accounts),
             },
         }
+
+
+UI_HTML = """<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>urn 節點</title>
+<style>
+:root{
+  --bg:#0f1115; --fg:#e8eaf0; --muted:#8b93a7; --line:#232838; --card:#161a24;
+  --accent:#4da3ff; --ok:#3ecf8e; --warn:#d8a93b; --err:#e5544b;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#f5f6fa;--fg:#161a22;--muted:#5d6577;--line:#e1e4ec;--card:#fff;
+        --accent:#1f6feb;--ok:#17945c;--warn:#96690b;--err:#c0342c}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:14px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans TC",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+       justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--line)}
+h1{margin:0;font-size:18px;font-weight:650}
+.sub{color:var(--muted);font-size:12px}
+#chips{display:flex;flex-wrap:wrap;gap:8px;padding:14px 22px 0}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:999px;
+      padding:3px 11px;font-size:12px;color:var(--muted)}
+.chip b{color:var(--fg);font-weight:600;margin-left:4px}
+main{padding:14px 22px 48px}
+#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+      padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.card-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.uid{font-weight:650;font-size:15px;overflow-wrap:anywhere}
+.badge{font-size:11px;padding:2px 8px;border-radius:999px;
+       border:1px solid currentColor;white-space:nowrap}
+.badge.ok{color:var(--ok)} .badge.warn{color:var(--warn)} .badge.err{color:var(--err)}
+.row{display:flex;gap:10px;align-items:baseline;font-size:13px}
+.row .k{color:var(--muted);flex:0 0 74px}
+.row .v{overflow-wrap:anywhere}
+code,.mono{font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+button{font:inherit;border-radius:8px;border:1px solid var(--line);
+       background:transparent;color:var(--fg);padding:6px 12px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{filter:brightness(1.08);color:#fff}
+button.danger{color:var(--err);border-color:var(--err)}
+button.danger:hover{background:var(--err);color:#fff}
+button.link{padding:0;border:0;background:none;color:var(--accent);text-align:left}
+button.link:hover{text-decoration:underline}
+button[disabled]{opacity:.5;cursor:default}
+.card-actions{display:flex;gap:8px;margin-top:4px}
+.empty{color:var(--muted);padding:28px;text-align:center;
+       border:1px dashed var(--line);border-radius:12px}
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);
+       color:var(--fg);padding:18px 20px;width:min(430px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog h2{margin:0 0 10px;font-size:15px}
+dialog p{margin:0 0 14px;color:var(--muted);overflow-wrap:anywhere}
+dialog label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+dialog input{width:100%;padding:8px 10px;border-radius:8px;
+       border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+.dlg-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+       background:var(--card);border:1px solid var(--line);border-radius:10px;
+       padding:9px 14px;font-size:13px;box-shadow:0 8px 26px rgba(0,0,0,.25);
+       opacity:0;pointer-events:none;transition:opacity .18s;max-width:90vw}
+#toast.show{opacity:1}
+#toast.err{color:var(--err);border-color:var(--err)}
+#busy{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;
+      place-items:center;z-index:20}
+#busy.show{display:grid}
+#busy span{background:var(--card);border:1px solid var(--line);border-radius:12px;
+           padding:14px 20px;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>urn 節點</h1><div class="sub" id="hostline"></div></div>
+  <div style="display:flex;gap:8px">
+    <button id="refresh">重新整理</button>
+    <button id="add" class="primary">新增節點</button>
+  </div>
+</header>
+<div id="chips"></div>
+<main><div id="list"></div></main>
+<div id="busy"><span id="busytext">處理中…</span></div>
+<div id="toast"></div>
+
+<dialog id="dlg-add">
+  <h2>新增節點</h2>
+  <label for="add-uid">名稱 (uid)</label>
+  <input id="add-uid" placeholder="例如 laptop" autocomplete="off" spellcheck="false">
+  <div class="dlg-actions">
+    <button data-close>取消</button>
+    <button class="primary" id="add-ok">建立</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-del">
+  <h2>刪除節點</h2>
+  <p id="del-who"></p>
+  <div class="dlg-actions">
+    <button data-close>取消</button>
+    <button class="danger" id="del-ok">確定刪除</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+const BASE = location.pathname.slice(-1) === "/" ? location.pathname : location.pathname + "/";
+let S = null, target = null, toastTimer = 0;
+const $ = s => document.querySelector(s);
+
+function el(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  if (props) for (const k in props) {
+    const v = props[k];
+    if (v == null) continue;
+    if (k === "class") n.className = v;
+    else if (k === "onclick") n.addEventListener("click", v);
+    else n[k] = v;
+  }
+  for (const kid of kids) if (kid != null && kid !== false) {
+    n.append(kid.nodeType ? kid : String(kid));
+  }
+  return n;
+}
+
+async function api(action, params) {
+  const u = new URL(BASE + action, location.href);
+  for (const k in (params || {})) if (params[k] != null) u.searchParams.set(k, params[k]);
+  const r = await fetch(u, {cache: "no-store"});
+  const t = await r.text();
+  if (!r.ok) throw new Error(t.trim() || ("HTTP " + r.status));
+  try { return JSON.parse(t); } catch { return t; }
+}
+
+function toast(msg, err) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show" + (err ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ""; }, 4200);
+}
+
+function busy(on, text) {
+  $("#busytext").textContent = text || "處理中…";
+  $("#busy").classList.toggle("show", !!on);
+}
+
+function fmtBytes(n) {
+  if (n == null || isNaN(n)) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 || v >= 100 ? Math.round(v) : v.toFixed(1)) + " " + u[i];
+}
+
+function fmtAgo(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 60) return s + " 秒前";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + " 分鐘前";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + " 小時前";
+  return Math.floor(h / 24) + " 天前";
+}
+
+function exitLabel(i) {
+  if (i.upstream) return "釘選 " + i.upstream.slice(0, 13) + "…";
+  return i.country || "自動";
+}
+
+async function copy(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已複製 " + text);
+  } catch { toast(text); }
+}
+
+function card(i) {
+  const socks = "socks5://" + (S.host || location.hostname) + ":" + i.port;
+  const state = !i.backend_alive ? ["err", "後端離線"]
+    : i.accepting === false ? ["warn", "暫停接受：" + (i.reason || "draining")]
+    : ["ok", "運作中"];
+  const quota = i.quota_max_bytes
+    ? fmtBytes(i.quota_left_bytes) + " / " + fmtBytes(i.quota_max_bytes)
+    : "未探測";
+  const row = (k, v) => el("div", {class: "row"},
+    el("span", {class: "k"}, k), el("span", {class: "v"}, v));
+  return el("div", {class: "card"},
+    el("div", {class: "card-top"},
+      el("div", {class: "uid"}, i.uid),
+      el("span", {class: "badge " + state[0]}, state[1])),
+    row("端口", el("code", null, String(i.port))),
+    row("連線", el("button", {
+      class: "link mono", title: "點擊複製", onclick: () => copy(socks)}, socks)),
+    row("出口", exitLabel(i)),
+    row("帳號", i.accounts + " 個"),
+    row("額度", quota),
+    row("連線數", String(i.relays || 0)),
+    row("上次換出口", fmtAgo(i.rotated_at)),
+    el("div", {class: "card-actions"},
+      el("button", {class: "primary", onclick: () => rotate(i)}, "換出口"),
+      el("button", {class: "danger", onclick: () => openDelete(i)}, "刪除")));
+}
+
+function render() {
+  $("#hostline").textContent = (S.host || location.hostname) + " · 每 15 秒自動更新";
+  const chips = $("#chips");
+  chips.textContent = "";
+  const chip = (label, value) => chips.append(
+    el("span", {class: "chip"}, label, el("b", null, String(value))));
+  chip("節點", S.instances.length);
+  chip("帳號空閒", S.accounts.free);
+  chip("已分配", S.accounts.assigned);
+  chip("失效", S.accounts.dead);
+  chip("額度剩餘", fmtBytes(S.accounts.quota_left_bytes));
+  const list = $("#list");
+  list.textContent = "";
+  if (!S.instances.length) {
+    list.append(el("div", {class: "empty"}, "目前沒有節點。按右上角「新增節點」建立一個。"));
+    return;
+  }
+  for (const i of S.instances) list.append(card(i));
+}
+
+async function refresh() {
+  try {
+    S = await api("ui-state");
+    render();
+  } catch (e) {
+    toast("載入失敗：" + e.message, true);
+  }
+}
+
+function openDelete(i) {
+  target = i;
+  $("#del-who").textContent =
+    "確定要刪除「" + i.uid + "」？會停止它的 urnproxy、釋放帳號與端口 " +
+    i.port + "，無法復原。";
+  $("#dlg-del").showModal();
+}
+
+async function rotate(i) {
+  busy(true, "正在換出口「" + i.uid + "」（最多抽選三次，可能要一分鐘）…");
+  try {
+    const r = await api("rotate", {uid: i.uid});
+    toast(i.uid + " 已換出口：" + exitLabel(r));
+  } catch (e) { toast("換出口失敗：" + e.message, true); }
+  finally { busy(false); refresh(); }
+}
+
+$("#refresh").onclick = refresh;
+$("#add").onclick = () => {
+  $("#add-uid").value = "";
+  $("#dlg-add").showModal();
+  setTimeout(() => $("#add-uid").focus(), 30);
+};
+document.querySelectorAll("[data-close]").forEach(b => {
+  b.onclick = () => b.closest("dialog").close();
+});
+
+$("#add-ok").onclick = async () => {
+  const uid = $("#add-uid").value.trim();
+  if (!uid) { toast("請填節點名稱", true); return; }
+  $("#dlg-add").close();
+  busy(true, "正在建立「" + uid + "」…");
+  try {
+    await api("register", {uid});
+    toast("已建立 " + uid);
+  } catch (e) { toast("建立失敗：" + e.message, true); }
+  finally { busy(false); refresh(); }
+};
+
+$("#del-ok").onclick = async () => {
+  if (!target) return;
+  const uid = target.uid;
+  $("#dlg-del").close();
+  busy(true, "刪除「" + uid + "」…");
+  try {
+    await api("delete", {uid});
+    toast("已刪除 " + uid);
+  } catch (e) { toast("刪除失敗：" + e.message, true); }
+  finally { busy(false); refresh(); }
+};
+
+refresh();
+setInterval(() => {
+  if (!document.querySelector("dialog[open]")) refresh();
+}, 15000);
+</script>
+</body>
+</html>
+"""
 
 
 # ── HTTP plumbing ───────────────────────────────────────────────────────────

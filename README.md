@@ -135,20 +135,23 @@ systemctl --user enable --now urn-pool urn-speed urn-hub.timer
 ```
 
 By default the API binds to the machine's Tailscale address (port 8090).
-Override with `--bind-host`. `--api-token <secret>` is optional; when given,
-every API path also lives under `/<secret>/`, keeping the dashboard off the
-bare root.
+Override with `--bind-host`. `--ui-token <secret>` is optional; when given,
+the dashboard and every API path also live under `/<secret>/`, and the bare
+root returns 404. Without a token the dashboard is served on `/` and only the
+tailnet can reach it.
 
 ## ⚙️ HTTP API
 
 | Endpoint | Meaning |
 |---|---|
+| `GET /` | 🖥 Dashboard: cards per client (port, exit, quota left/max, relays), add / delete / rotate buttons. Served under `/<secret>/` when `--ui-token` is set |
+| `GET /ui-state` | 📦 JSON the dashboard polls (same shape as `/status`, plus per-client `quota_left_bytes` / `quota_max_bytes`) |
 | `GET /register?uid=<name>` | 🚪 Reserve a client: allocate an account, start urnproxy, return its stable port. Idempotent per name. Optional `&country=<Country>` (default United States) or `&provider=<uuid>` to pin one provider |
 | `GET /delete?uid=<name>` | 🗑 Tear the instance down, release account and port |
 | `GET /sub[?uid=<name>]` | 🧾 mihomo YAML with that node (or every node) |
 | `GET /country?uid=<name>&country=<Country>` | 🔁 Move the client to another country, invisibly |
 | `GET /country?uid=<name>&provider=<uuid>` | 🎯 Pin an exact upstream provider |
-| `GET /rotate?uid=<name>` | ♻️ Re-pick a provider (same country), exit IP changes; retry-safe |
+| `GET /rotate?uid=<name>` | ♻️ Whole-pool rotate: weighted random provider pick from the hub open set (cached / pinned country replaced), up to three picks verified before it answers 500 |
 | `GET /locations` | 🌍 Available countries (URnetwork provider-locations) |
 | `GET /providers?country=us&limit=600` | 📡 Raw provider list for a country |
 | `GET /status` | 📊 Per-client state and pool accounting (free/assigned/dead, quota bytes) |

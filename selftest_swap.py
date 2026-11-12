@@ -33,13 +33,19 @@ w.allocate_tokens = lambda uid, n: ["B"]
 w.args = types.SimpleNamespace(log_dir="/tmp/sweeptest/swap")
 
 spawned = []
-w.spawn_backend = lambda inst, tokens, port: (spawned.append(list(tokens)),
-                                              types.SimpleNamespace(stop=lambda: None))[1]
+
+
+async def spawn_backend(inst, tokens, port):
+    spawned.append(list(tokens))
+    return types.SimpleNamespace(stop=lambda: None, proc=None)
+
+
+w.spawn_backend = spawn_backend
 
 calls = {"n": 0}
 
 
-async def wait_ready(port, timeout=None):
+async def wait_ready(port, timeout=None, proc=None):
     calls["n"] += 1
     return calls["n"] >= 2        # 第一次失敗、第二次成功
 

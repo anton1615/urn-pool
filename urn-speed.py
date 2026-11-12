@@ -29,6 +29,9 @@ POOL = os.path.join(HERE, "pool.txt")
 SPEED_POOL = os.path.join(HERE, "speed-pool.txt")
 POOL_DB = os.path.join(HERE, "db.sqlite")   # urn-pool's store (read-only use)
 URNPROXY = os.environ.get("URNPROXY", os.path.expanduser("~/urnproxy"))
+# adapter egress proxy ("" = direct). A SOCKS5 hop spreads the spawn/contract
+# pressure off this host's address; measurements then include the hop.
+EGRESS_PROXY = os.environ.get("URN_SPEED_PROXY", "")
 API = "https://api.bringyour.com"
 
 BATCH = 6
@@ -42,7 +45,10 @@ FAIL_MAX = 5                     # consecutive dead dials -> cooldown
 FAIL_COOLDOWN = 24 * 3600
 READY_TIMEOUT = 45.0
 EXIT_TTL = 24 * 3600
-TEST_BYTES = 200_000 + 3 * 8_000_000 + 1_000_000   # approx, incl. overhead
+LIVE_BYTES = 200_000               # spawn handshake + one ip-api call (~80 KB real)
+# fraction of tests that also measure throughput; the rest only refresh
+# liveness (alive/sp_fail/rtt) and cleanliness (exit ip/risk)
+SPEED_FRACTION = float(os.environ.get("SPEED_MEASURE_FRACTION", "0"))
 HOSTING_KEYWORDS = ("hosting", "datacenter", "data center", "cloud",
                     "server", "colo", "vps")
 
@@ -299,21 +305,30 @@ def exit_quality(port: int, conn: sqlite3.Connection) -> tuple[str, int] | None:
 
 
 def test_provider(conn: sqlite3.Connection, accounts: Accounts,
-                  slot_q: queue.Queue, client_id: str) -> str:
+                  slot_q: queue.Queue, client_id: str) -> tuple[str, int]:
+    """One provider: spawn -> liveness -> cleanliness (-> optional speed).
+
+    Returns (status, bytes spent). Bytes are what the account quota really
+    paid for: a live probe is ~LIVE_BYTES, a speed test ~25 MB.
+    """
     port = slot_q.get()
     proc = None
     try:
         try:
-            seed, _jwt = accounts.pick()
+            seed, jwt = accounts.pick()
         except LoginRejected as exc:
             log(f"  {client_id[:16]}: {exc}")
-            return "noaccount"
+            return "noaccount", 0
         env = os.environ.copy()
         env["USER_AUTH"] = seed
+        # /auth/login is rate limited per network address: reuse the cached by_jwt
+        env["BY_JWT"] = jwt
+        if EGRESS_PROXY:
+            env["URN_PROXY"] = EGRESS_PROXY
         env["PASSWORD"] = "urn-speed"
         proc = subprocess.Popen(
             [URNPROXY, "--addr", f"127.0.0.1:{port}", "--provider-id", client_id],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=open(f"/tmp/urnspd/adapter-{port}.log","w"), stderr=subprocess.STDOUT,
             start_new_session=True, env=env)
         deadline = time.time() + READY_TIMEOUT
         ready = False
@@ -332,23 +347,38 @@ def test_provider(conn: sqlite3.Connection, accounts: Accounts,
                 "UPDATE providers SET sp_fail=sp_fail+1, sp_ts=?, alive=0 "
                 "WHERE client_id=?", (time.time(), client_id))
             conn.commit()
-            return "noreach"
+            return "noreach", LIVE_BYTES
         alive, rtt = socks_alive(port)
         if not alive:
             conn.execute(
                 "UPDATE providers SET sp_fail=sp_fail+1, sp_ts=?, alive=0 "
                 "WHERE client_id=?", (time.time(), client_id))
             conn.commit()
-            return "dead"
+            return "dead", LIVE_BYTES
+        # one ip-api call through the exit: exit ip + cleanliness, cached per ip
+        eq = exit_quality(port, conn)
+        if eq is None:
+            conn.execute(
+                "UPDATE providers SET sp_fail=sp_fail+1, sp_ts=?, alive=0 "
+                "WHERE client_id=?", (time.time(), client_id))
+            conn.commit()
+            return "no-exit", LIVE_BYTES
+        if random.random() >= SPEED_FRACTION:
+            # liveness + cleanliness only: keep the last speed score
+            conn.execute(
+                """UPDATE providers SET sp_ts=?, sp_fail=0, u_ok=1, alive=1,
+                     rtt_ms=?, exit_ip=? WHERE client_id=?""",
+                (time.time(), rtt, eq[0], client_id))
+            conn.commit()
+            return "live rtt=%.0fms risk=%d" % (rtt, eq[1]), LIVE_BYTES
         got = measure(port)
         if got is None:
             conn.execute(
                 "UPDATE providers SET sp_fail=sp_fail+1, sp_ts=? "
                 "WHERE client_id=?", (time.time(), client_id))
             conn.commit()
-            return "nospeed"
+            return "nospeed", LIVE_BYTES
         mbps, used_bytes = got
-        eq = exit_quality(port, conn)
         conn.execute(
             """UPDATE providers SET
                  sp_ewma=CASE WHEN sp_ewma IS NULL OR sp_ewma<0 THEN ?
@@ -359,8 +389,8 @@ def test_provider(conn: sqlite3.Connection, accounts: Accounts,
             (mbps, mbps, mbps, time.time(), rtt,
              eq[0] if eq else None, client_id))
         conn.commit()
-        return f"ok {mbps:.1f}Mbps {used_bytes // 1_000_000}MB " \
-               f"risk={eq[1] if eq else '?'}"
+        return (f"ok {mbps:.1f}Mbps {used_bytes // 1_000_000}MB risk={eq[1]}",
+                used_bytes)
     finally:
         if proc is not None and proc.poll() is None:
             proc.kill()
@@ -376,7 +406,10 @@ def main() -> int:
     for i in range(WORKERS):
         slot_q.put(PORT_BASE + i)
     from concurrent.futures import ThreadPoolExecutor
-    log(f"speed daemon up: workers={WORKERS} budget={DAILY_GB}GB/day")
+    log(f"speed daemon up: workers={WORKERS} "
+        f"budget={'unlimited' if DAILY_GB <= 0 else '%.0fGB/day' % DAILY_GB} "
+        f"egress={EGRESS_PROXY or 'direct'} "
+        f"speed_sample={SPEED_FRACTION or 'off'}")
     while True:
         try:
             load1 = float(open("/proc/loadavg").read().split()[0])
@@ -386,7 +419,7 @@ def main() -> int:
                 continue
             day = time.strftime("%Y-%m-%d", time.gmtime())
             used = int(meta_get(conn, f"bytes:{day}") or 0)
-            if used > DAILY_GB * 1e9:
+            if DAILY_GB > 0 and used > DAILY_GB * 1e9:
                 log(f"daily budget {used / 1e9:.0f}GB reached, idling")
                 time.sleep(600)
                 continue
@@ -398,11 +431,13 @@ def main() -> int:
             with ThreadPoolExecutor(max_workers=WORKERS) as pool:
                 results = list(pool.map(
                     lambda cid: test_provider(conn, accounts, slot_q, cid), due))
-            used += TEST_BYTES * len(due)
+            used += sum(spent for _status, spent in results)
             meta_set(conn, f"bytes:{day}", str(used))
-            ok = sum(1 for r in results if r.startswith("ok"))
-            log(f"batch: {ok}/{len(due)} ok; day {used / 1e9:.0f}GB/"
-                f"{DAILY_GB:.0f}GB | " + "; ".join(results))
+            ok = sum(1 for status, _ in results
+                     if status.startswith(("ok", "live")))
+            budget = f"{DAILY_GB:.0f}GB" if DAILY_GB > 0 else "unlimited"
+            log(f"batch: {ok}/{len(due)} ok-or-live; day {used / 1e9:.2f}GB/"
+                f"{budget} | " + "; ".join(s for s, _ in results))
         except Exception as exc:  # noqa: BLE001
             log(f"cycle failed: {exc}")
             time.sleep(60)
