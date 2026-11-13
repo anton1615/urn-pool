@@ -1,5 +1,10 @@
 # urn-pool
 
+> ⚠️ **Deprecated** — this standalone repo is now part of
+> [anton1615/proxy-pool-collection](https://github.com/anton1615/proxy-pool-collection).
+> New work targets the collection repository; this one is kept for historical
+> reference and will not receive further updates.
+
 **One shared URnetwork account pool, many clients.** `urn-pool` turns
 [urnproxy](https://github.com/urnetwork/proxy) — the URnetwork SOCKS5 `socks`
 adapter, patched to log in with a **seedphrase** instead of email/password —
